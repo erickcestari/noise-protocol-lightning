@@ -35,9 +35,10 @@ impl Noise {
         }
     }
 
-    pub fn act_one(&mut self) -> Vec<u8> {
+    pub fn act_one(&mut self) -> Result<Vec<u8>, NoiseError> {
         let secret_key = rand::rng().random::<[u8; 32]>();
-        let ephemeral_keypair = Keypair::from_seckey_byte_array(&self.secp, secret_key).unwrap();
+        let ephemeral_keypair = Keypair::from_seckey_byte_array(&self.secp, secret_key)
+            .map_err(|_| NoiseError::EphemeralKeyGenerationFailed)?;
 
         // h = SHA256(h || ephemeral_pubkey)
         self.hash = sha256::Hash::hash(&concat_bytes(&[
@@ -52,9 +53,14 @@ impl Noise {
 
         let hkdf = Hkdf::<sha256::Hash>::new(&self.ck, &es_shared_secret.secret_bytes());
         let mut okm = [0u8; 64];
-        hkdf.expand(&INFO, &mut okm).unwrap();
-        self.ck = okm[..32].try_into().unwrap();
-        let temp_k1: [u8; 32] = okm[32..].try_into().unwrap();
+        hkdf.expand(&INFO, &mut okm)
+            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
+        self.ck = okm[..32]
+            .try_into()
+            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
+        let temp_k1: [u8; 32] = okm[32..]
+            .try_into()
+            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
 
         let mut hash_bytes: Vec<u8> = self.hash.clone().to_byte_array().to_vec();
         let message_tag = encrypt_with_ad(temp_k1, 0, &mut hash_bytes, &mut []);
@@ -68,7 +74,11 @@ impl Noise {
             &message_tag,
         ]);
 
-        message
+        Ok(message)
+    }
+
+    pub fn act_two(&mut self, act_two_message: [u8; 50]) -> Result<Vec<u8>, NoiseError> {
+        Ok(vec![])
     }
 }
 
@@ -107,3 +117,23 @@ fn concat_bytes<'a>(slices: &[&'a [u8]]) -> Vec<u8> {
     }
     buf
 }
+#[derive(Debug)]
+pub enum NoiseError {
+    InvalidMessageVersion,
+    HkdfExpansionFailed,
+    EphemeralKeyGenerationFailed,
+}
+
+impl std::fmt::Display for NoiseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NoiseError::InvalidMessageVersion => write!(f, "Invalid message version"),
+            NoiseError::HkdfExpansionFailed => write!(f, "HKDF expansion failed"),
+            NoiseError::EphemeralKeyGenerationFailed => {
+                write!(f, "Ephemeral key generation failed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NoiseError {}

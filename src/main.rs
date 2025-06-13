@@ -1,14 +1,14 @@
 use std::{
-    io::{Read, Write, Result as IoResult},
+    io::{Read, Result as IoResult, Write},
     net::TcpStream,
     time::Duration,
 };
 
-use noise_protocol_lightning::{noise::Noise, ACT_TWO_BUFFER_SIZE};
+use noise_protocol_lightning::{ACT_TWO_BUFFER_SIZE, noise::Noise};
 use rand::Rng;
 use secp256k1::Keypair;
 
-fn main() -> IoResult<()> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let secp = secp256k1::Secp256k1::new();
 
     // Predefined responder keys
@@ -21,7 +21,7 @@ fn main() -> IoResult<()> {
     let initiator_keys = Keypair::from_seckey_byte_array(&secp, secret_key).unwrap();
 
     let mut noise = Noise::new(responder_public_key, initiator_keys);
-    let act_one_message = noise.act_one();
+    let act_one_message = noise.act_one()?;
     println!("act one message: {}", hex::encode(act_one_message.clone()));
 
     // Connect to Lightning node
