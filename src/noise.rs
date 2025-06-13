@@ -1,5 +1,6 @@
 use bitcoin_hashes::{Hkdf, sha256};
 use chacha20_poly1305::{ChaCha20Poly1305, Key, Nonce};
+use rand::Rng;
 use secp256k1::{Keypair, PublicKey};
 
 use crate::{MESSAGE_VERSION, PROLOGUE, PROTOCOL_NAME};
@@ -35,14 +36,9 @@ impl Noise {
     }
 
     pub fn act_one(&mut self) -> Vec<u8> {
-        // let secret_key = rand::rng().random::<[u8; 32]>();
-        // let ephemeral_keypair = Keypair::from_seckey_byte_array(&secp, secret_key).unwrap();
-        // Predefined ephemeral keys
-        let ls_priv_hex = "1212121212121212121212121212121212121212121212121212121212121212";
-        let ls_priv_bytes = hex::decode(ls_priv_hex).unwrap();
-        let mut ls_priv_array = [0u8; 32];
-        ls_priv_array.copy_from_slice(&ls_priv_bytes);
-        let ephemeral_keypair = Keypair::from_seckey_byte_array(&self.secp, ls_priv_array).unwrap();
+        let secret_key = rand::rng().random::<[u8; 32]>();
+        let ephemeral_keypair = Keypair::from_seckey_byte_array(&self.secp, secret_key).unwrap();
+
         // h = SHA256(h || ephemeral_pubkey)
         self.hash = sha256::Hash::hash(&concat_bytes(&[
             self.hash.as_byte_array(),
@@ -65,6 +61,7 @@ impl Noise {
 
         self.hash = sha256::Hash::hash(&concat_bytes(&[self.hash.as_byte_array(), &message_tag]));
 
+        // MESSAGE_VERSION || ephemeral_pubkey || encrypted_message_tag
         let message = concat_bytes(&[
             &MESSAGE_VERSION.to_le_bytes(),
             ephemeral_keypair.public_key().serialize().as_ref(),
