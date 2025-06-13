@@ -1,0 +1,11 @@
+[package]
+name = "noise-protocol-lightning"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bitcoin_hashes = "0.16.0"
+chacha20-poly1305 = "0.1.2"
+hex = "0.4.3"
+rand = "0.9.1"
+secp256k1 = "0.31.0"
