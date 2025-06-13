@@ -17,5 +17,6 @@ fn main() {
     let initiator_keys = Keypair::from_seckey_byte_array(&secp, ls_priv_array).unwrap();
     
     let mut noise = Noise::new(responder_public_key, initiator_keys);
-    noise.act_one();
+    let message = noise.act_one();
+    println!("act one message: {}", hex::encode(message));
 }

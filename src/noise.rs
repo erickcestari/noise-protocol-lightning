@@ -1,12 +1,8 @@
-use bitcoin_hashes::{
-    Hkdf,
-    hex::{Case, DisplayHex},
-    sha256,
-};
+use bitcoin_hashes::{Hkdf, sha256};
 use chacha20_poly1305::{ChaCha20Poly1305, Key, Nonce};
 use secp256k1::{Keypair, PublicKey};
 
-use crate::{PROLOGUE, PROTOCOL_NAME};
+use crate::{MESSAGE_VERSION, PROLOGUE, PROTOCOL_NAME};
 
 const INFO: [u8; 0] = [];
 pub struct Noise {
@@ -14,6 +10,7 @@ pub struct Noise {
     pub initiator_keys: Keypair,
     pub hash: sha256::Hash,
     pub ck: [u8; 32],
+    pub secp: secp256k1::Secp256k1<secp256k1::All>,
 }
 
 impl Noise {
@@ -33,11 +30,11 @@ impl Noise {
             initiator_keys,
             hash,
             ck,
+            secp: secp256k1::Secp256k1::new(),
         }
     }
 
-    pub fn act_one(&mut self) {
-        let secp = secp256k1::Secp256k1::new();
+    pub fn act_one(&mut self) -> Vec<u8> {
         // let secret_key = rand::rng().random::<[u8; 32]>();
         // let ephemeral_keypair = Keypair::from_seckey_byte_array(&secp, secret_key).unwrap();
         // Predefined ephemeral keys
@@ -45,44 +42,36 @@ impl Noise {
         let ls_priv_bytes = hex::decode(ls_priv_hex).unwrap();
         let mut ls_priv_array = [0u8; 32];
         ls_priv_array.copy_from_slice(&ls_priv_bytes);
-        let ephemeral_keypair = Keypair::from_seckey_byte_array(&secp, ls_priv_array).unwrap();
+        let ephemeral_keypair = Keypair::from_seckey_byte_array(&self.secp, ls_priv_array).unwrap();
         // h = SHA256(h || ephemeral_pubkey)
         self.hash = sha256::Hash::hash(&concat_bytes(&[
             self.hash.as_byte_array(),
             &ephemeral_keypair.public_key().serialize(),
         ]));
 
-        println!("h: {}", self.hash.to_string());
-
-        println!(
-            "&self.responder_pubkey: {}",
-            &self.responder_pubkey.to_string()
-        );
-        println!(
-            "&ephemeral_keypair.secret key(): {}",
-            &ephemeral_keypair.secret_bytes().to_hex_string(Case::Lower)
-        );
-
         let es_shared_secret = secp256k1::ecdh::SharedSecret::new(
             &self.responder_pubkey,
             &ephemeral_keypair.secret_key(),
         );
 
-        println!(
-            "full shared point: {}",
-            es_shared_secret.secret_bytes().to_hex_string(Case::Lower)
-        );
         let hkdf = Hkdf::<sha256::Hash>::new(&self.ck, &es_shared_secret.secret_bytes());
         let mut okm = [0u8; 64];
         hkdf.expand(&INFO, &mut okm).unwrap();
         self.ck = okm[..32].try_into().unwrap();
         let temp_k1: [u8; 32] = okm[32..].try_into().unwrap();
 
-        println!("ck: {}", self.ck.to_hex_string(Case::Lower));
-        println!("temp_k1: {}", temp_k1.to_hex_string(Case::Lower));
         let mut hash_bytes: Vec<u8> = self.hash.clone().to_byte_array().to_vec();
         let message_tag = encrypt_with_ad(temp_k1, 0, &mut hash_bytes, &mut []);
-        println!("message_tag: {}", message_tag.to_hex_string(Case::Lower));
+
+        self.hash = sha256::Hash::hash(&concat_bytes(&[self.hash.as_byte_array(), &message_tag]));
+
+        let message = concat_bytes(&[
+            &MESSAGE_VERSION.to_le_bytes(),
+            ephemeral_keypair.public_key().serialize().as_ref(),
+            &message_tag,
+        ]);
+
+        message
     }
 }
 
