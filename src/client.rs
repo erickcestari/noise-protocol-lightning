@@ -113,7 +113,7 @@ impl NoiseClient {
                 }
                 Ok(bytes_read) => {
                     message_count += 1;
-                    self.handle_received_message(&buffer[..bytes_read], message_count);
+                    let _ = self.handle_received_message(&buffer[..bytes_read], message_count);
                 }
                 Err(e) => match e.kind() {
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
@@ -138,9 +138,132 @@ impl NoiseClient {
         Ok(())
     }
 
-    fn handle_received_message(&self, data: &[u8], message_number: usize) {
-        println!("Message #{} ({} bytes):", message_number, data.len());
-        println!("   Hex: {}", hex::encode(data));
+    fn handle_received_message(
+        &mut self,
+        data: &[u8],
+        message_number: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        println!(
+            "Message #{} ({} bytes received):",
+            message_number,
+            data.len()
+        );
+        println!("   Raw Hex: {}", hex::encode(data));
+        let mut cursor = 0;
+
+        while cursor < data.len() {
+            // Step 1: Read exactly 18 bytes for the encrypted length prefix
+            if cursor + 18 > data.len() {
+                println!(
+                    "   Incomplete length prefix (need 18 bytes, got {})",
+                    data.len() - cursor
+                );
+                break;
+            }
+
+            let lc = &data[cursor..cursor + 18];
+            cursor += 18;
+
+            // Step 2: Decrypt the length prefix to get the packet size
+            println!("   Encrypted length prefix: {}", hex::encode(lc));
+
+            match self.noise.decrypt_length(lc) {
+                Ok(packet_length) => {
+                    println!("   Decrypted packet length: {}", packet_length);
+
+                    // Step 3: Read exactly l+16 bytes for the encrypted packet
+                    let encrypted_packet_size = packet_length as usize + 16; // +16 for the MAC
+
+                    if cursor + encrypted_packet_size > data.len() {
+                        println!(
+                            "   Incomplete encrypted packet (need {} bytes, got {})",
+                            encrypted_packet_size,
+                            data.len() - cursor
+                        );
+                        break;
+                    }
+
+                    let c = &data[cursor..cursor + encrypted_packet_size];
+                    cursor += encrypted_packet_size;
+
+                    println!(
+                        "   Encrypted packet ({} bytes): {}",
+                        c.len(),
+                        hex::encode(c)
+                    );
+
+                    // Step 4: Decrypt the packet to get the plaintext
+                    match self.noise.decrypt_message(c) {
+                        Ok(plaintext) => {
+                            println!(
+                                "   ✓ Decrypted message ({} bytes): {}",
+                                plaintext.len(),
+                                hex::encode(&plaintext)
+                            );
+
+                            // Try to parse as Lightning message if possible
+                            if let Ok(message_type) = self.parse_lightning_message(&plaintext) {
+                                println!("   Lightning message type: {}", message_type);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("   ✗ Failed to decrypt message: {}", e);
+                            return Err(e.into());
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("   ✗ Failed to decrypt length prefix: {}", e);
+                    return Err(e.into());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn parse_lightning_message(
+        &self,
+        plaintext: &[u8],
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        if plaintext.len() < 2 {
+            return Err("Message too short to contain type".into());
+        }
+
+        let message_type = u16::from_be_bytes([plaintext[0], plaintext[1]]);
+
+        let type_name = match message_type {
+            16 => "init",
+            17 => "error",
+            18 => "warning",
+            32 => "open_channel",
+            33 => "accept_channel",
+            34 => "funding_created",
+            35 => "funding_signed",
+            36 => "channel_ready",
+            38 => "shutdown",
+            39 => "closing_signed",
+            128 => "update_add_htlc",
+            130 => "update_fulfill_htlc",
+            131 => "update_fail_htlc",
+            132 => "commitment_signed",
+            133 => "revoke_and_ack",
+            134 => "update_fee",
+            135 => "update_fail_malformed_htlc",
+            136 => "channel_reestablish",
+            256 => "channel_announcement",
+            257 => "node_announcement",
+            258 => "channel_update",
+            259 => "announce_signatures",
+            261 => "query_short_channel_ids",
+            262 => "reply_short_channel_ids_end",
+            263 => "query_channel_range",
+            264 => "reply_channel_range",
+            265 => "gossip_timestamp_filter",
+            _ => "unknown",
+        };
+
+        Ok(format!("{} ({})", type_name, message_type))
     }
 
     fn handle_read_error(&self, error: &std::io::Error, context: &str) {

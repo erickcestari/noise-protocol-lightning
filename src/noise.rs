@@ -201,6 +201,78 @@ impl Noise {
 
         Ok(message)
     }
+
+    /// Decrypts the 18-byte encrypted length prefix to get the message length
+    pub fn decrypt_length(&mut self, encrypted_length: &[u8]) -> Result<u16, NoiseError> {
+        if encrypted_length.len() != 18 {
+            return Err(NoiseError::InvalidLengthPrefix);
+        }
+
+        let decrypt_key = self.decrypt_key.ok_or(NoiseError::DecryptKeyNotSet)?;
+
+        // Split the encrypted length into ciphertext (2 bytes) and tag (16 bytes)
+        let ciphertext_len = encrypted_length.len() - 16;
+        let mut ciphertext = encrypted_length[..ciphertext_len].to_vec();
+        let tag = &encrypted_length[ciphertext_len..];
+
+        // Decrypt using ChaCha20-Poly1305 with current receive nonce
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[4..12].copy_from_slice(&self.receive_nounce.to_le_bytes());
+
+        let nonce_ref = Nonce::new(nonce_bytes);
+        let key_ref = Key::new(decrypt_key);
+        let cipher = ChaCha20Poly1305::new(key_ref, nonce_ref);
+
+        // Decrypt with empty associated data (as per protocol)
+        let tag_array: [u8; 16] = tag.try_into().map_err(|_| NoiseError::InvalidTag)?;
+        cipher
+            .decrypt(&mut ciphertext, tag_array, None)
+            .map_err(|_| NoiseError::DecryptionFailed)?;
+
+        // Increment receive nonce after successful decryption
+        self.receive_nounce += 1;
+
+        // Convert decrypted bytes to u16 (big-endian as per Lightning spec)
+        if ciphertext.len() != 2 {
+            return Err(NoiseError::InvalidLengthPrefix);
+        }
+
+        let length = u16::from_be_bytes([ciphertext[0], ciphertext[1]]);
+        Ok(length)
+    }
+
+    /// Decrypts a message payload using the current receive key and nonce
+    pub fn decrypt_message(&mut self, encrypted_message: &[u8]) -> Result<Vec<u8>, NoiseError> {
+        if encrypted_message.len() < 16 {
+            return Err(NoiseError::MessageTooShort);
+        }
+
+        let decrypt_key = self.decrypt_key.ok_or(NoiseError::DecryptKeyNotSet)?;
+
+        // Split the encrypted message into ciphertext and tag (last 16 bytes)
+        let ciphertext_len = encrypted_message.len() - 16;
+        let mut ciphertext = encrypted_message[..ciphertext_len].to_vec();
+        let tag = &encrypted_message[ciphertext_len..];
+
+        // Decrypt using ChaCha20-Poly1305 with current receive nonce
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[4..12].copy_from_slice(&self.receive_nounce.to_le_bytes());
+
+        let nonce_ref = Nonce::new(nonce_bytes);
+        let key_ref = Key::new(decrypt_key);
+        let cipher = ChaCha20Poly1305::new(key_ref, nonce_ref);
+
+        // Decrypt with empty associated data (as per protocol)
+        let tag_array: [u8; 16] = tag.try_into().map_err(|_| NoiseError::InvalidTag)?;
+        cipher
+            .decrypt(&mut ciphertext, tag_array, None)
+            .map_err(|_| NoiseError::DecryptionFailed)?;
+
+        // Increment receive nonce after successful decryption
+        self.receive_nounce += 1;
+
+        Ok(ciphertext)
+    }
 }
 
 fn encrypt_with_ad(
@@ -266,12 +338,19 @@ fn concat_bytes<'a>(slices: &[&'a [u8]]) -> Vec<u8> {
     }
     buf
 }
+
+// Add new error variants to NoiseError enum
 #[derive(Debug)]
 pub enum NoiseError {
     InvalidMessageVersion,
     HkdfExpansionFailed,
     EphemeralKeyGenerationFailed,
     InvalidSharedPublicKeyActTwo,
+    InvalidLengthPrefix,
+    DecryptKeyNotSet,
+    DecryptionFailed,
+    InvalidTag,
+    MessageTooShort,
 }
 
 impl std::fmt::Display for NoiseError {
@@ -285,6 +364,11 @@ impl std::fmt::Display for NoiseError {
             NoiseError::InvalidSharedPublicKeyActTwo => {
                 write!(f, "Invalid shared public key in Act Two message")
             }
+            NoiseError::InvalidLengthPrefix => write!(f, "Invalid length prefix"),
+            NoiseError::DecryptKeyNotSet => write!(f, "Decrypt key not set"),
+            NoiseError::DecryptionFailed => write!(f, "Decryption failed"),
+            NoiseError::InvalidTag => write!(f, "Invalid authentication tag"),
+            NoiseError::MessageTooShort => write!(f, "Message too short to contain valid data"),
         }
     }
 }
