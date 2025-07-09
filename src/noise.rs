@@ -6,6 +6,11 @@ use secp256k1::{Keypair, PublicKey, constants::PUBLIC_KEY_SIZE};
 use crate::{ACT_TWO_BUFFER_SIZE, MESSAGE_VERSION, MESSAGE_VERSION_SIZE, PROLOGUE, PROTOCOL_NAME};
 
 const INFO: [u8; 0] = [];
+const NONCE_SIZE: usize = 12;
+const TAG_SIZE: usize = 16;
+const LENGTH_PREFIX_SIZE: usize = 18;
+const ENCRYPTED_LENGTH_SIZE: usize = 2;
+
 pub struct Noise {
     pub responder_pubkey: PublicKey,
     pub initiator_keys: Keypair,
@@ -15,7 +20,7 @@ pub struct Noise {
     pub ephemeral_keypair: Option<Keypair>,
     pub responder_ephemeral_pubkey: Option<PublicKey>,
     pub temp_k2: Option<[u8; 32]>,
-    pub receive_nounce: u64,
+    pub receive_nonce: u64,
     pub send_nonce: u64,
     pub send_chaining_key: Option<[u8; 32]>,
     pub receive_chaining_key: Option<[u8; 32]>,
@@ -27,14 +32,14 @@ impl Noise {
     pub fn new(responder_pubkey: PublicKey, initiator_keys: Keypair) -> Self {
         // h = SHA256(PROTOCOL_NAME)
         let mut hash = sha256::Hash::hash(PROTOCOL_NAME.as_bytes());
-        let ck = *hash.clone().as_byte_array();
+        let ck = *hash.as_byte_array();
+
         // h = SHA256(h || prologue)
-        hash = sha256::Hash::hash(&concat_bytes(&[hash.as_byte_array(), PROLOGUE.as_bytes()]));
+        hash = Self::update_hash(&hash, PROLOGUE.as_bytes());
+
         // h = SHA256(h || responder_pubkey)
-        hash = sha256::Hash::hash(&concat_bytes(&[
-            hash.as_byte_array(),
-            &responder_pubkey.serialize(),
-        ]));
+        hash = Self::update_hash(&hash, &responder_pubkey.serialize());
+
         Self {
             responder_pubkey,
             initiator_keys,
@@ -44,7 +49,7 @@ impl Noise {
             ephemeral_keypair: None,
             responder_ephemeral_pubkey: None,
             temp_k2: None,
-            receive_nounce: 0,
+            receive_nonce: 0,
             send_nonce: 0,
             send_chaining_key: None,
             receive_chaining_key: None,
@@ -57,11 +62,9 @@ impl Noise {
         let secret_key = rand::rng().random::<[u8; 32]>();
         let ephemeral_keypair = Keypair::from_seckey_byte_array(&self.secp, secret_key)
             .map_err(|_| NoiseError::EphemeralKeyGenerationFailed)?;
+
         // h = SHA256(h || ephemeral_pubkey)
-        self.hash = sha256::Hash::hash(&concat_bytes(&[
-            self.hash.as_byte_array(),
-            &ephemeral_keypair.public_key().serialize(),
-        ]));
+        self.hash = Self::update_hash(&self.hash, &ephemeral_keypair.public_key().serialize());
         self.ephemeral_keypair = Some(ephemeral_keypair);
 
         let es_shared_secret = secp256k1::ecdh::SharedSecret::new(
@@ -69,21 +72,13 @@ impl Noise {
             &ephemeral_keypair.secret_key(),
         );
 
-        let hkdf = Hkdf::<sha256::Hash>::new(&self.ck, &es_shared_secret.secret_bytes());
-        let mut okm = [0u8; 64];
-        hkdf.expand(&INFO, &mut okm)
-            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
-        self.ck = okm[..32]
-            .try_into()
-            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
-        let temp_k1: [u8; 32] = okm[32..]
-            .try_into()
-            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
+        let (new_ck, temp_k1) = self.derive_keys(&es_shared_secret.secret_bytes())?;
+        self.ck = new_ck;
 
-        let mut hash_bytes: Vec<u8> = self.hash.clone().to_byte_array().to_vec();
-        let message_tag = encrypt_with_ad(temp_k1, 0, &mut hash_bytes, &mut []);
+        let hash_bytes = self.hash.to_byte_array().to_vec();
+        let message_tag = encrypt_with_ad(temp_k1, 0, &hash_bytes, &mut []);
 
-        self.hash = sha256::Hash::hash(&concat_bytes(&[self.hash.as_byte_array(), &message_tag]));
+        self.hash = Self::update_hash(&self.hash, &message_tag);
 
         // MESSAGE_VERSION || ephemeral_pubkey || encrypted_message_tag
         let message = concat_bytes(&[
@@ -103,41 +98,31 @@ impl Noise {
         if version != MESSAGE_VERSION {
             return Err(NoiseError::InvalidMessageVersion);
         }
+
         let responder_ephemeral_pubkey =
             PublicKey::from_slice(&act_two_message[MESSAGE_VERSION_SIZE..PUBLIC_KEY_SIZE + 1])
                 .map_err(|_| NoiseError::InvalidSharedPublicKeyActTwo)?;
+
         self.responder_ephemeral_pubkey = Some(responder_ephemeral_pubkey);
         let message_tag = &act_two_message[PUBLIC_KEY_SIZE + 1..];
 
         // h = SHA256(h || responder_ephemeral_pubkey)
-        self.hash = sha256::Hash::hash(&concat_bytes(&[
-            self.hash.as_byte_array(),
-            &responder_ephemeral_pubkey.serialize(),
-        ]));
+        self.hash = Self::update_hash(&self.hash, &responder_ephemeral_pubkey.serialize());
 
         let ee_shared_secret = secp256k1::ecdh::SharedSecret::new(
             &responder_ephemeral_pubkey,
             &self.ephemeral_keypair.unwrap().secret_key(),
         );
 
-        let hkdf = Hkdf::<sha256::Hash>::new(&self.ck, &ee_shared_secret.secret_bytes());
-        let mut okm = [0u8; 64];
-        hkdf.expand(&INFO, &mut okm)
-            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
-        self.ck = okm[..32]
-            .try_into()
-            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
-        let temp_k2: [u8; 32] = okm[32..]
-            .try_into()
-            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
-
+        let (new_ck, temp_k2) = self.derive_keys(&ee_shared_secret.secret_bytes())?;
+        self.ck = new_ck;
         self.temp_k2 = Some(temp_k2);
 
-        let hash_bytes: Vec<u8> = self.hash.clone().to_byte_array().to_vec();
-        decrypt_with_ad(temp_k2, 0, &hash_bytes, &mut message_tag.to_vec());
+        let hash_bytes = self.hash.to_byte_array().to_vec();
+        let _ = decrypt_with_ad(temp_k2, 0, &hash_bytes, &mut message_tag.to_vec());
 
         // h = SHA256(h || message_tag)
-        self.hash = sha256::Hash::hash(&concat_bytes(&[self.hash.as_byte_array(), &message_tag]));
+        self.hash = Self::update_hash(&self.hash, message_tag);
         Ok(())
     }
 
@@ -151,48 +136,26 @@ impl Noise {
         );
 
         // h = SHA256(h || encrypted_pubkey)
-        self.hash = sha256::Hash::hash(&concat_bytes(&[
-            self.hash.as_byte_array(),
-            &encrypted_pubkey,
-        ]));
+        self.hash = Self::update_hash(&self.hash, &encrypted_pubkey);
 
         let se_shared_secret = secp256k1::ecdh::SharedSecret::new(
             &self.responder_ephemeral_pubkey.unwrap(),
             &self.initiator_keys.secret_key(),
         );
 
-        let hkdf = Hkdf::<sha256::Hash>::new(&self.ck, &se_shared_secret.secret_bytes());
-        let mut okm = [0u8; 64];
-        hkdf.expand(&INFO, &mut okm)
-            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
-        self.ck = okm[..32]
-            .try_into()
-            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
-        let temp_3: [u8; 32] = okm[32..]
-            .try_into()
-            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
+        let (new_ck, temp_k3) = self.derive_keys(&se_shared_secret.secret_bytes())?;
+        self.ck = new_ck;
 
         self.receive_chaining_key = Some(self.ck);
         self.send_chaining_key = Some(self.ck);
 
-        let mut hash_bytes: Vec<u8> = self.hash.clone().to_byte_array().to_vec();
-        let message_tag = encrypt_with_ad(temp_3, 0, &mut hash_bytes, &mut []);
+        let hash_bytes = self.hash.to_byte_array().to_vec();
+        let message_tag = encrypt_with_ad(temp_k3, 0, &hash_bytes, &mut []);
 
-        let hkdf = Hkdf::<sha256::Hash>::new(&self.ck, &[]);
-        let mut okm = [0u8; 64];
-        hkdf.expand(&INFO, &mut okm)
-            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
-        let encrypt_key: [u8; 32] = okm[..32]
-            .try_into()
-            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
-        let decrypt_key: [u8; 32] = okm[32..]
-            .try_into()
-            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
+        // Derive final encryption/decryption keys
+        self.derive_final_keys()?;
 
-        self.encrypt_key = Some(encrypt_key);
-        self.decrypt_key = Some(decrypt_key);
-
-        // MESSAGE_VERSION || encrypted_initator_pubkey || message_tag
+        // MESSAGE_VERSION || encrypted_initiator_pubkey || message_tag
         let message = concat_bytes(&[
             &MESSAGE_VERSION.to_le_bytes(),
             &encrypted_pubkey,
@@ -204,36 +167,14 @@ impl Noise {
 
     /// Decrypts the 18-byte encrypted length prefix to get the message length
     pub fn decrypt_length(&mut self, encrypted_length: &[u8]) -> Result<u16, NoiseError> {
-        if encrypted_length.len() != 18 {
+        if encrypted_length.len() != LENGTH_PREFIX_SIZE {
             return Err(NoiseError::InvalidLengthPrefix);
         }
 
         let decrypt_key = self.decrypt_key.ok_or(NoiseError::DecryptKeyNotSet)?;
+        let ciphertext = self.decrypt_data(encrypted_length, decrypt_key, self.receive_nonce)?;
 
-        // Split the encrypted length into ciphertext (2 bytes) and tag (16 bytes)
-        let ciphertext_len = encrypted_length.len() - 16;
-        let mut ciphertext = encrypted_length[..ciphertext_len].to_vec();
-        let tag = &encrypted_length[ciphertext_len..];
-
-        // Decrypt using ChaCha20-Poly1305 with current receive nonce
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[4..12].copy_from_slice(&self.receive_nounce.to_le_bytes());
-
-        let nonce_ref = Nonce::new(nonce_bytes);
-        let key_ref = Key::new(decrypt_key);
-        let cipher = ChaCha20Poly1305::new(key_ref, nonce_ref);
-
-        // Decrypt with empty associated data (as per protocol)
-        let tag_array: [u8; 16] = tag.try_into().map_err(|_| NoiseError::InvalidTag)?;
-        cipher
-            .decrypt(&mut ciphertext, tag_array, None)
-            .map_err(|_| NoiseError::DecryptionFailed)?;
-
-        // Increment receive nonce after successful decryption
-        self.receive_nounce += 1;
-
-        // Convert decrypted bytes to u16 (big-endian as per Lightning spec)
-        if ciphertext.len() != 2 {
+        if ciphertext.len() != ENCRYPTED_LENGTH_SIZE {
             return Err(NoiseError::InvalidLengthPrefix);
         }
 
@@ -243,35 +184,138 @@ impl Noise {
 
     /// Decrypts a message payload using the current receive key and nonce
     pub fn decrypt_message(&mut self, encrypted_message: &[u8]) -> Result<Vec<u8>, NoiseError> {
-        if encrypted_message.len() < 16 {
+        if encrypted_message.len() < TAG_SIZE {
             return Err(NoiseError::MessageTooShort);
         }
 
         let decrypt_key = self.decrypt_key.ok_or(NoiseError::DecryptKeyNotSet)?;
+        let ciphertext = self.decrypt_data(encrypted_message, decrypt_key, self.receive_nonce)?;
 
-        // Split the encrypted message into ciphertext and tag (last 16 bytes)
-        let ciphertext_len = encrypted_message.len() - 16;
-        let mut ciphertext = encrypted_message[..ciphertext_len].to_vec();
-        let tag = &encrypted_message[ciphertext_len..];
+        self.receive_nonce += 1;
+        Ok(ciphertext)
+    }
 
-        // Decrypt using ChaCha20-Poly1305 with current receive nonce
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[4..12].copy_from_slice(&self.receive_nounce.to_le_bytes());
+    pub fn encrypt_and_format_message(&mut self, message: &[u8]) -> Result<Vec<u8>, NoiseError> {
+        if message.len() > 65535 {
+            return Err(NoiseError::MessageTooLong);
+        }
 
-        let nonce_ref = Nonce::new(nonce_bytes);
-        let key_ref = Key::new(decrypt_key);
-        let cipher = ChaCha20Poly1305::new(key_ref, nonce_ref);
+        // Step 1: Encrypt the length prefix (2 bytes big-endian)
+        let length = message.len() as u16;
+        let encrypted_length = self.encrypt_length(length)?;
 
-        // Decrypt with empty associated data (as per protocol)
-        let tag_array: [u8; 16] = tag.try_into().map_err(|_| NoiseError::InvalidTag)?;
+        // Step 2: Encrypt the message payload
+        let encrypted_message = self.encrypt_message(message)?;
+
+        // Step 3: Concatenate encrypted length prefix and encrypted message
+        let mut output = Vec::with_capacity(encrypted_length.len() + encrypted_message.len());
+        output.extend_from_slice(&encrypted_length);
+        output.extend_from_slice(&encrypted_message);
+
+        Ok(output)
+    }
+
+    /// Encrypts a message payload using the current send key and nonce
+    pub fn encrypt_message(&mut self, message: &[u8]) -> Result<Vec<u8>, NoiseError> {
+        let encrypt_key = self.encrypt_key.ok_or(NoiseError::EncryptKeyNotSet)?;
+        let encrypted_data = self.encrypt_data(message, encrypt_key, self.send_nonce)?;
+
+        self.send_nonce += 1;
+        Ok(encrypted_data)
+    }
+
+    /// Encrypts the 2-byte message length into an 18-byte encrypted length prefix
+    pub fn encrypt_length(&mut self, length: u16) -> Result<Vec<u8>, NoiseError> {
+        let length_bytes = length.to_be_bytes();
+        let encrypt_key = self.encrypt_key.ok_or(NoiseError::EncryptKeyNotSet)?;
+        let encrypted_length = self.encrypt_data(&length_bytes, encrypt_key, self.send_nonce)?;
+
+        self.send_nonce += 1;
+        Ok(encrypted_length)
+    }
+
+    fn encrypt_data(
+        &self,
+        plaintext: &[u8],
+        key: [u8; 32],
+        nonce: u64,
+    ) -> Result<Vec<u8>, NoiseError> {
+        let mut plaintext_copy = plaintext.to_vec();
+        let nonce_bytes = Self::create_nonce(nonce);
+        let cipher = ChaCha20Poly1305::new(Key::new(key), Nonce::new(nonce_bytes));
+
+        let tag = cipher.encrypt(&mut plaintext_copy, None);
+
+        let mut result = Vec::with_capacity(plaintext.len() + TAG_SIZE);
+        result.extend_from_slice(&plaintext_copy);
+        result.extend_from_slice(&tag);
+        Ok(result)
+    }
+
+    fn update_hash(current_hash: &sha256::Hash, data: &[u8]) -> sha256::Hash {
+        sha256::Hash::hash(&concat_bytes(&[current_hash.as_byte_array(), data]))
+    }
+
+    fn derive_keys(&self, shared_secret: &[u8]) -> Result<([u8; 32], [u8; 32]), NoiseError> {
+        let hkdf = Hkdf::<sha256::Hash>::new(&self.ck, shared_secret);
+        let mut okm = [0u8; 64];
+        hkdf.expand(&INFO, &mut okm)
+            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
+
+        let ck = okm[..32]
+            .try_into()
+            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
+        let temp_key = okm[32..]
+            .try_into()
+            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
+
+        Ok((ck, temp_key))
+    }
+
+    fn derive_final_keys(&mut self) -> Result<(), NoiseError> {
+        let hkdf = Hkdf::<sha256::Hash>::new(&self.ck, &[]);
+        let mut okm = [0u8; 64];
+        hkdf.expand(&INFO, &mut okm)
+            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
+
+        let encrypt_key = okm[..32]
+            .try_into()
+            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
+        let decrypt_key = okm[32..]
+            .try_into()
+            .map_err(|_| NoiseError::HkdfExpansionFailed)?;
+
+        self.encrypt_key = Some(encrypt_key);
+        self.decrypt_key = Some(decrypt_key);
+        Ok(())
+    }
+
+    fn decrypt_data(
+        &self,
+        encrypted_data: &[u8],
+        key: [u8; 32],
+        nonce: u64,
+    ) -> Result<Vec<u8>, NoiseError> {
+        let ciphertext_len = encrypted_data.len() - TAG_SIZE;
+        let mut ciphertext = encrypted_data[..ciphertext_len].to_vec();
+        let tag = &encrypted_data[ciphertext_len..];
+
+        let nonce_bytes = Self::create_nonce(nonce);
+        let cipher = ChaCha20Poly1305::new(Key::new(key), Nonce::new(nonce_bytes));
+
+        let tag_array: [u8; TAG_SIZE] = tag.try_into().map_err(|_| NoiseError::InvalidTag)?;
+
         cipher
             .decrypt(&mut ciphertext, tag_array, None)
             .map_err(|_| NoiseError::DecryptionFailed)?;
 
-        // Increment receive nonce after successful decryption
-        self.receive_nounce += 1;
-
         Ok(ciphertext)
+    }
+
+    fn create_nonce(nonce: u64) -> [u8; NONCE_SIZE] {
+        let mut nonce_bytes = [0u8; NONCE_SIZE];
+        nonce_bytes[4..12].copy_from_slice(&nonce.to_le_bytes());
+        nonce_bytes
     }
 }
 
@@ -281,24 +325,14 @@ fn encrypt_with_ad(
     associated_data: &[u8],
     plaintext: &mut [u8],
 ) -> Vec<u8> {
-    // Encode nonce as: 32 zero bits + little-endian 64-bit value
-    // This creates a 12-byte nonce (96 bits) as required by ChaCha20-Poly1305
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes[4..12].copy_from_slice(&nonce.to_le_bytes());
+    let nonce_bytes = Noise::create_nonce(nonce);
+    let cipher = ChaCha20Poly1305::new(Key::new(key), Nonce::new(nonce_bytes));
 
-    // Create ChaCha20-Poly1305 cipher
-    let nonce_ref = Nonce::new(nonce_bytes);
-    let key_ref = Key::new(key);
-    let cipher = ChaCha20Poly1305::new(key_ref, nonce_ref);
-
-    // Encrypt the plaintext in place and get the authentication tag
     let tag = cipher.encrypt(plaintext, Some(associated_data));
 
-    // Return ciphertext + tag
-    let mut result = Vec::with_capacity(plaintext.len() + 16);
-    result.extend_from_slice(plaintext); // Now contains ciphertext
-    result.extend_from_slice(&tag); // Append 16-byte tag
-
+    let mut result = Vec::with_capacity(plaintext.len() + TAG_SIZE);
+    result.extend_from_slice(plaintext);
+    result.extend_from_slice(&tag);
     result
 }
 
@@ -308,29 +342,21 @@ fn decrypt_with_ad(
     associated_data: &[u8],
     ciphertext: &mut [u8],
 ) -> Vec<u8> {
-    // Encode nonce as: 32 zero bits + little-endian 64-bit value
-    // This creates a 12-byte nonce (96 bits) as required by ChaCha20-Poly1305
-    let mut nonce_bytes = [0u8; 12];
-    nonce_bytes[4..12].copy_from_slice(&nonce.to_le_bytes());
+    let nonce_bytes = Noise::create_nonce(nonce);
+    let cipher = ChaCha20Poly1305::new(Key::new(key), Nonce::new(nonce_bytes));
 
-    // Create ChaCha20-Poly1305 cipher
-    let nonce_ref = Nonce::new(nonce_bytes);
-    let key_ref = Key::new(key);
-    let cipher = ChaCha20Poly1305::new(key_ref, nonce_ref);
-
-    let tag = ciphertext[ciphertext.len() - 16..ciphertext.len()]
+    let tag = ciphertext[ciphertext.len() - TAG_SIZE..]
         .try_into()
         .unwrap();
-    let mut ciphertext = ciphertext[..ciphertext.len() - 16].to_vec();
+    let mut ciphertext = ciphertext[..ciphertext.len() - TAG_SIZE].to_vec();
 
     cipher
         .decrypt(&mut ciphertext, tag, Some(associated_data))
         .unwrap();
-
     ciphertext
 }
 
-fn concat_bytes<'a>(slices: &[&'a [u8]]) -> Vec<u8> {
+fn concat_bytes(slices: &[&[u8]]) -> Vec<u8> {
     let total_len: usize = slices.iter().map(|s| s.len()).sum();
     let mut buf = Vec::with_capacity(total_len);
     for slice in slices {
@@ -339,9 +365,10 @@ fn concat_bytes<'a>(slices: &[&'a [u8]]) -> Vec<u8> {
     buf
 }
 
-// Add new error variants to NoiseError enum
 #[derive(Debug)]
 pub enum NoiseError {
+    EncryptKeyNotSet,
+    EncryptionFailed,
     InvalidMessageVersion,
     HkdfExpansionFailed,
     EphemeralKeyGenerationFailed,
@@ -350,6 +377,7 @@ pub enum NoiseError {
     DecryptKeyNotSet,
     DecryptionFailed,
     InvalidTag,
+    MessageTooLong,
     MessageTooShort,
 }
 
@@ -369,6 +397,9 @@ impl std::fmt::Display for NoiseError {
             NoiseError::DecryptionFailed => write!(f, "Decryption failed"),
             NoiseError::InvalidTag => write!(f, "Invalid authentication tag"),
             NoiseError::MessageTooShort => write!(f, "Message too short to contain valid data"),
+            NoiseError::EncryptKeyNotSet => write!(f, "Encrypt key not set"),
+            NoiseError::EncryptionFailed => write!(f, "Encryption failed"),
+            NoiseError::MessageTooLong => write!(f, "Message too long to be encrypted"),
         }
     }
 }
