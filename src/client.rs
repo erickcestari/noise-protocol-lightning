@@ -8,7 +8,7 @@ use std::{
 use rand::Rng;
 use secp256k1::Keypair;
 
-use crate::{ACT_TWO_BUFFER_SIZE, noise::Noise};
+use crate::{ACT_TWO_BUFFER_SIZE, messages::message::MessageType, noise::Noise};
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -209,49 +209,23 @@ impl NoiseClient {
             return Err("Message too short to contain type".into());
         }
 
-        let message_type = u16::from_be_bytes([plaintext[0], plaintext[1]]);
-
-        let type_name = match message_type {
-            16 => "init",
-            17 => "error",
-            18 => "warning",
-            32 => "open_channel",
-            33 => "accept_channel",
-            34 => "funding_created",
-            35 => "funding_signed",
-            36 => "channel_ready",
-            38 => "shutdown",
-            39 => "closing_signed",
-            128 => "update_add_htlc",
-            130 => "update_fulfill_htlc",
-            131 => "update_fail_htlc",
-            132 => "commitment_signed",
-            133 => "revoke_and_ack",
-            134 => "update_fee",
-            135 => "update_fail_malformed_htlc",
-            136 => "channel_reestablish",
-            256 => "channel_announcement",
-            257 => "node_announcement",
-            258 => "channel_update",
-            259 => "announce_signatures",
-            261 => "query_short_channel_ids",
-            262 => "reply_short_channel_ids_end",
-            263 => "query_channel_range",
-            264 => "reply_channel_range",
-            265 => "gossip_timestamp_filter",
-            _ => "unknown",
-        };
-
-        println!("{} ({})", type_name, message_type);
-
-        if message_type == 16 {
-            let init = self.noise.encrypt_and_format_message(plaintext)?;
-            println!(
-                "   Sending init message(size: {}): {}",
-                init.len(),
-                hex::encode(&init)
-            );
-            self.send_message(&init)?;
+        let message_type = MessageType::from_bytes(plaintext);
+        match message_type {
+            MessageType::Init => {
+                let init = self.noise.encrypt_and_format_message(plaintext)?;
+                println!(
+                    "   Sending init message(size: {}): {}",
+                    init.len(),
+                    hex::encode(&init)
+                );
+                self.send_message(&init)?;
+            }
+            MessageType::Unknown => {
+                println!("   Unknown message type: {}", message_type);
+            }
+            _ => {
+                println!("   Message type: {}", message_type);
+            }
         }
 
         Ok(())

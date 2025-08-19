@@ -1,4 +1,5 @@
 pub mod client;
+pub mod messages;
 pub mod noise;
 
 pub const PROTOCOL_NAME: &str = "Noise_XK_secp256k1_ChaChaPoly_SHA256";
